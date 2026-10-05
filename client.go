@@ -20,6 +20,16 @@ import (
 	"github.com/emersion/go-sasl"
 )
 
+// Extensions is a snapshot of the extensions advertised by the server in an
+// EHLO or LHLO greeting.
+//
+// The map key is the upper-case extension name and the value is the
+// extension parameters (empty for extensions without parameters). The
+// snapshot is taken when the greeting is received: it is not affected by
+// later changes to the client state, so it is safe to keep a reference to
+// it for the duration of a mail transaction.
+type Extensions map[string]string
+
 // A Client represents a client connection to an SMTP server.
 type Client struct {
 	// keep a reference to the connection so it can be used to create a TLS
@@ -28,13 +38,19 @@ type Client struct {
 	text       *textproto.Conn
 	serverName string
 	lmtp       bool
-	ext        map[string]string // supported extensions
-	localName  string            // the name to use in HELO/EHLO/LHLO
-	didGreet   bool              // whether we've received greeting from server
-	greetError error             // the error from the greeting
-	didHello   bool              // whether we've said HELO/EHLO/LHLO
-	helloError error             // the error from the hello
-	rcpts      []string          // recipients accumulated for the current transaction
+	ext        Extensions // snapshot of supported extensions from the last EHLO/LHLO
+	localName  string     // the name to use in HELO/EHLO/LHLO
+	didGreet   bool       // whether we've received greeting from server
+	greetError error      // the error from the greeting
+	didHello   bool       // whether we've said HELO/EHLO/LHLO
+	helloError error      // the error from the hello
+	rcpts      []string   // recipients accumulated for the current transaction
+
+	// caps is the extension snapshot bound to the current mail transaction.
+	// It is captured when Mail starts a transaction and is used for every
+	// capability check until the transaction is reset, so a transaction only
+	// uses the capabilities confirmed by the EHLO/LHLO that started it.
+	caps Extensions
 
 	// Time to wait for command responses (this includes 3xx reply to DATA).
 	CommandTimeout time.Duration
@@ -210,7 +226,7 @@ func (c *Client) hello() error {
 		return err
 	}
 
-	c.didHello = true
+	c.helloError = nil
 	if err := c.ehlo(); err != nil {
 		var smtpError *SMTPError
 		if errors.As(err, &smtpError) && (smtpError.Code == 500 || smtpError.Code == 502) {
@@ -220,7 +236,14 @@ func (c *Client) hello() error {
 			c.helloError = err
 		}
 	}
-	return c.helloError
+	if c.helloError != nil {
+		// The greeting didn't complete: don't mark the client as ready, so
+		// stale capabilities can't be used and the next attempt starts over.
+		c.didHello = false
+		return c.helloError
+	}
+	c.didHello = true
+	return nil
 }
 
 // Hello sends a HELO or EHLO to the server as the given host name.
@@ -239,6 +262,41 @@ func (c *Client) Hello(localName string) error {
 	}
 	c.localName = localName
 	return c.hello()
+}
+
+// EHLO sends an explicit EHLO (or LHLO for an LMTP client) to the server as
+// the given host name and returns a snapshot of the extensions advertised by
+// the server.
+//
+// Unlike Hello, EHLO does not fall back to HELO if the server does not
+// support EHLO: an error is returned and the client stays in the greeting
+// state. The returned snapshot is not affected by later changes to the
+// client state, so it can safely be kept for the duration of a mail
+// transaction.
+//
+// If server returns an error, it will be of type *SMTPError.
+func (c *Client) EHLO(localName string) (Extensions, error) {
+	if err := validateLine(localName); err != nil {
+		return nil, err
+	}
+	if c.didHello {
+		return nil, errors.New("smtp: EHLO called after other methods")
+	}
+	c.localName = localName
+	if err := c.greet(); err != nil {
+		return nil, err
+	}
+	if err := c.ehlo(); err != nil {
+		// EHLO didn't complete: don't mark the client as ready and make
+		// sure capabilities from a previous greeting are not used.
+		c.didHello = false
+		c.helloError = nil
+		c.ext = nil
+		return nil, err
+	}
+	c.didHello = true
+	c.helloError = nil
+	return c.ext, nil
 }
 
 func (c *Client) readResponse(expectCode int) (int, string, error) {
@@ -285,7 +343,7 @@ func (c *Client) ehlo() error {
 	if err != nil {
 		return err
 	}
-	ext := make(map[string]string)
+	ext := make(Extensions)
 	extList := strings.Split(msg, "\n")
 	if len(extList) > 1 {
 		extList = extList[1:]
@@ -298,8 +356,11 @@ func (c *Client) ehlo() error {
 			}
 		}
 	}
+	// Commit the snapshot only after the whole greeting succeeded, so a
+	// failed EHLO/LHLO leaves the capabilities from a previous greeting
+	// invalidated instead of mixing with the new ones.
 	c.ext = ext
-	return err
+	return nil
 }
 
 // startTLS sends the STARTTLS command and encrypts all further communication.
@@ -328,7 +389,14 @@ func (c *Client) startTLS(config *tls.Config) error {
 		testHookStartTLS(config)
 	}
 	c.setConn(tls.Client(c.conn, config))
+	// The capabilities advertised before STARTTLS belong to the
+	// plaintext connection and are no longer valid. Invalidate them so
+	// they can't be used before the new EHLO/LHLO completes.
+	c.ext = nil
+	c.caps = nil
 	c.didHello = false
+	c.helloError = nil
+	c.rcpts = nil
 	return nil
 }
 
@@ -431,31 +499,40 @@ func (c *Client) Mail(from string, opts *MailOptions) error {
 		return err
 	}
 
+	// Bind the mail transaction to the capabilities confirmed by the
+	// current EHLO/LHLO snapshot. The transaction uses only these
+	// capabilities, so later changes to the shared map can't mix with
+	// the ones used here.
+	c.caps = make(Extensions, len(c.ext))
+	for k, v := range c.ext {
+		c.caps[k] = v
+	}
+
 	var sb strings.Builder
 	// A high enough power of 2 than 510+14+26+11+9+9+39+500
 	sb.Grow(2048)
 	fmt.Fprintf(&sb, "MAIL FROM:<%s>", from)
-	if _, ok := c.ext["8BITMIME"]; ok {
+	if _, ok := c.caps["8BITMIME"]; ok {
 		sb.WriteString(" BODY=8BITMIME")
 	}
-	if _, ok := c.ext["SIZE"]; ok && opts != nil && opts.Size != 0 {
+	if _, ok := c.caps["SIZE"]; ok && opts != nil && opts.Size != 0 {
 		fmt.Fprintf(&sb, " SIZE=%v", opts.Size)
 	}
 	if opts != nil && opts.RequireTLS {
-		if _, ok := c.ext["REQUIRETLS"]; ok {
+		if _, ok := c.caps["REQUIRETLS"]; ok {
 			sb.WriteString(" REQUIRETLS")
 		} else {
 			return errors.New("smtp: server does not support REQUIRETLS")
 		}
 	}
 	if opts != nil && opts.UTF8 {
-		if _, ok := c.ext["SMTPUTF8"]; ok {
+		if _, ok := c.caps["SMTPUTF8"]; ok {
 			sb.WriteString(" SMTPUTF8")
 		} else {
 			return errors.New("smtp: server does not support SMTPUTF8")
 		}
 	}
-	if _, ok := c.ext["DSN"]; ok && opts != nil {
+	if _, ok := c.caps["DSN"]; ok && opts != nil {
 		switch opts.Return {
 		case DSNReturnFull, DSNReturnHeaders:
 			fmt.Fprintf(&sb, " RET=%s", string(opts.Return))
@@ -472,12 +549,12 @@ func (c *Client) Mail(from string, opts *MailOptions) error {
 		}
 	}
 	if opts != nil && opts.Auth != nil {
-		if _, ok := c.ext["AUTH"]; ok {
+		if _, ok := c.caps["AUTH"]; ok {
 			fmt.Fprintf(&sb, " AUTH=%s", encodeXtext(*opts.Auth))
 		}
 		// We can safely discard parameter if server does not support AUTH.
 	}
-	if _, ok := c.ext["DELIVERBY"]; ok && opts != nil && opts.DeliverBy != nil {
+	if _, ok := c.caps["DELIVERBY"]; ok && opts != nil && opts.DeliverBy != nil {
 		by := int(opts.DeliverBy.Time.Seconds())
 		// Specified in rfc2852
 		// by-time      = ["-" / "+"]1*9digit ; a negative or zero value is not
@@ -494,7 +571,7 @@ func (c *Client) Mail(from string, opts *MailOptions) error {
 		}
 		sb.WriteString(arg)
 	}
-	if _, ok := c.ext["MT-PRIORITY"]; ok && opts != nil && opts.MTPriority != nil {
+	if _, ok := c.caps["MT-PRIORITY"]; ok && opts != nil && opts.MTPriority != nil {
 		if *opts.MTPriority < -9 || *opts.MTPriority > 9 {
 			return errors.New("smtp: MT-PRIORITY must be between -9 and 9")
 		}
@@ -523,11 +600,20 @@ func (c *Client) Rcpt(to string, opts *RcptOptions) error {
 		return err
 	}
 
+	// Use the capabilities bound to the current mail transaction so a
+	// transaction only uses the capabilities confirmed by its EHLO/LHLO.
+	// Rcpt is normally preceded by Mail, which binds the snapshot; fall
+	// back to the latest snapshot for direct calls.
+	caps := c.caps
+	if caps == nil {
+		caps = c.ext
+	}
+
 	var sb strings.Builder
 	// A high enough power of 2 than 510+29+501
 	sb.Grow(2048)
 	fmt.Fprintf(&sb, "RCPT TO:<%s>", to)
-	if _, ok := c.ext["DSN"]; ok && opts != nil {
+	if _, ok := caps["DSN"]; ok && opts != nil {
 		if len(opts.Notify) != 0 {
 			sb.WriteString(" NOTIFY=")
 			if err := checkNotifySet(opts.Notify); err != nil {
@@ -549,7 +635,7 @@ func (c *Client) Rcpt(to string, opts *RcptOptions) error {
 				}
 				enc = encodeXtext(opts.OriginalRecipient)
 			case DSNAddressTypeUTF8:
-				if _, ok := c.ext["SMTPUTF8"]; ok {
+				if _, ok := caps["SMTPUTF8"]; ok {
 					enc = encodeUTF8AddrUnitext(opts.OriginalRecipient)
 				} else {
 					enc = encodeUTF8AddrXtext(opts.OriginalRecipient)
@@ -560,7 +646,7 @@ func (c *Client) Rcpt(to string, opts *RcptOptions) error {
 			fmt.Fprintf(&sb, " ORCPT=%s;%s", string(opts.OriginalRecipientType), enc)
 		}
 	}
-	if _, ok := c.ext["RRVS"]; ok && opts != nil && !opts.RequireRecipientValidSince.IsZero() {
+	if _, ok := caps["RRVS"]; ok && opts != nil && !opts.RequireRecipientValidSince.IsZero() {
 		sb.WriteString(fmt.Sprintf(" RRVS=%s", opts.RequireRecipientValidSince.Format(time.RFC3339)))
 	}
 	if _, _, err := c.cmd(25, "%s", sb.String()); err != nil {
@@ -885,6 +971,7 @@ func (c *Client) Reset() error {
 	c.helloError = nil
 
 	c.rcpts = nil
+	c.caps = nil
 	return nil
 }
 

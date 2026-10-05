@@ -21,6 +21,16 @@ provides a server implementation and a number of client improvements.
 
 See [CONTRIBUTING.md] for contribution guidelines.
 
+## Testing
+
+Run the test suite with:
+
+	go test ./...
+
+To run only the client tests related to the EHLO capability snapshot:
+
+	go test -run 'TestClientEHLO|TestClientSTARTTLSInvalidatesCaps|TestClientTransactionBindsCaps|TestClientEHLOFailureSkipsMAIL' .
+
 ## Licence
 
 MIT

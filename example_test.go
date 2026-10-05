@@ -6,8 +6,11 @@ package smtp_test
 
 import (
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"strings"
+	"time"
 
 	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
@@ -47,6 +50,88 @@ func ExampleDial() {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+// scriptedConn is an in-memory connection whose server side is a fixed
+// script of responses. It retains the SMTP phase between commands but does
+// not record AUTH values, so the command receipt is deterministic and free
+// of credentials.
+type scriptedConn struct {
+	reader io.Reader
+	writer io.Writer
+}
+
+func (c *scriptedConn) Read(b []byte) (int, error)         { return c.reader.Read(b) }
+func (c *scriptedConn) Write(b []byte) (int, error)        { return c.writer.Write(b) }
+func (c *scriptedConn) Close() error                       { return nil }
+func (c *scriptedConn) LocalAddr() net.Addr                { return nil }
+func (c *scriptedConn) RemoteAddr() net.Addr               { return nil }
+func (c *scriptedConn) SetDeadline(time.Time) error        { return nil }
+func (c *scriptedConn) SetReadDeadline(time.Time) error    { return nil }
+func (c *scriptedConn) SetWriteDeadline(time.Time) error   { return nil }
+
+// ExampleClient_EHLO demonstrates the explicit EHLO snapshot: the client
+// performs an EHLO handshake, receives a snapshot of the server's
+// capabilities, and the mail transaction uses only the capabilities
+// confirmed by that EHLO.
+func ExampleClient_EHLO() {
+	server := "220 mail.example.com ESMTP service ready\r\n" +
+		"250-mail.example.com Hello\r\n" +
+		"250-8BITMIME\r\n" +
+		"250-SMTPUTF8\r\n" +
+		"250 Ok\r\n" +
+		"250 Ok\r\n" +
+		"250 Ok\r\n" +
+		"354 End data with <CR><LF>.<CR><LF>\r\n" +
+		"250 Ok: queued\r\n" +
+		"221 Bye\r\n"
+
+	var cmds strings.Builder
+	conn := &scriptedConn{
+		reader: strings.NewReader(server),
+		writer: &cmds,
+	}
+
+	c := smtp.NewClient(conn)
+	defer c.Close()
+
+	// Perform an explicit EHLO and get a snapshot of the server's
+	// capabilities.
+	caps, err := c.EHLO("localhost")
+	if err != nil {
+		log.Fatal(err)
+	}
+	_, smtpUTF8 := caps["SMTPUTF8"]
+	fmt.Printf("SMTPUTF8: %v\n", smtpUTF8)
+
+	// The mail transaction uses the capabilities confirmed by this EHLO.
+	if err := c.Mail("user@example.com", nil); err != nil {
+		log.Fatal(err)
+	}
+	if err := c.Rcpt("other@example.com", nil); err != nil {
+		log.Fatal(err)
+	}
+	wc, err := c.Data()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := wc.Close(); err != nil {
+		log.Fatal(err)
+	}
+	if err := c.Quit(); err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Print(cmds.String())
+	// Output:
+	// SMTPUTF8: true
+	// EHLO localhost
+	// MAIL FROM:<user@example.com> BODY=8BITMIME
+	// RCPT TO:<other@example.com>
+	// DATA
+	//
+	// .
+	// QUIT
 }
 
 // variables to make ExamplePlainAuth compile, without adding

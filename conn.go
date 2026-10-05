@@ -22,6 +22,45 @@ import (
 // Number of errors we'll tolerate per connection before closing. Defaults to 3.
 const errThreshold = 3
 
+// connPhase identifies the current stage of the explicit server-side
+// transaction state machine. Every MAIL, RCPT, DATA, BDAT and RSET command
+// is observed and gated against this state before the backend session is
+// invoked, so the backend is only called in a valid phase.
+type connPhase int
+
+const (
+	// phaseGreet: waiting for HELO/EHLO/LHLO, no session yet.
+	phaseGreet connPhase = iota
+	// phaseReady: greeted, no mail transaction in progress.
+	phaseReady
+	// phaseMail: MAIL accepted for the current transaction, waiting for RCPT.
+	phaseMail
+	// phaseRcpt: at least one RCPT accepted for the current transaction,
+	// waiting for more RCPT or DATA/BDAT.
+	phaseRcpt
+	// phaseData: DATA/BDAT message transfer of the current transaction
+	// is in progress.
+	phaseData
+)
+
+// String returns a human-readable name of the transaction phase, useful
+// for debugging and tests.
+func (p connPhase) String() string {
+	switch p {
+	case phaseGreet:
+		return "GREET"
+	case phaseReady:
+		return "READY"
+	case phaseMail:
+		return "MAIL"
+	case phaseRcpt:
+		return "RCPT"
+	case phaseData:
+		return "DATA"
+	}
+	return "UNKNOWN"
+}
+
 type Conn struct {
 	conn   net.Conn
 	text   *textproto.Conn
@@ -41,6 +80,10 @@ type Conn struct {
 	dataResult      chan error
 	bytesReceived   int64 // counts total size of chunks when BDAT is used
 
+	// phase is the explicit transaction state observed by the command
+	// gate. fromReceived and recipients carry the identity of the
+	// transaction the phase belongs to.
+	phase        connPhase
 	fromReceived bool
 	recipients   []string
 	didAuth      bool
@@ -170,6 +213,10 @@ func (c *Conn) Close() error {
 	c.locker.Lock()
 	defer c.locker.Unlock()
 
+	// Disconnecting aborts only the transaction currently in progress on
+	// this connection (if any) and logs out this connection's own session.
+	// Sessions of other connections are never touched: no Session.Reset
+	// or Session.Logout is invoked on their behalf.
 	if c.bdatPipe != nil {
 		c.bdatPipe.CloseWithError(ErrDataReset)
 		c.bdatPipe = nil
@@ -244,6 +291,7 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 
 		c.setSession(sess)
 	}
+	c.phase = phaseReady
 
 	if !enhanced {
 		c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("Hello %s", domain))
@@ -316,12 +364,19 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 
 // READY state -> waiting for MAIL
 func (c *Conn) handleMail(arg string) {
-	if c.helo == "" {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
+	// Explicit transaction state gate: MAIL only starts a new transaction
+	// from the READY phase. The backend is not invoked otherwise.
+	switch c.phase {
+	case phaseGreet:
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
 		return
-	}
-	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
+	case phaseData:
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
+		return
+	case phaseMail, phaseRcpt:
+		// A transaction is already in progress: reject a nested/duplicate
+		// MAIL command. The client must use RSET to start over.
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "MAIL command already received, use RSET to reset the transaction")
 		return
 	}
 
@@ -476,8 +531,9 @@ func (c *Conn) handleMail(arg string) {
 		return
 	}
 
-	c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("Roger, accepting mail from <%v>", from))
 	c.fromReceived = true
+	c.phase = phaseMail
+	c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("Roger, accepting mail from <%v>", from))
 }
 
 // This regexp matches 'hexchar' token defined in
@@ -702,12 +758,16 @@ func isPrintableASCII(val string) bool {
 
 // MAIL state -> waiting for RCPTs followed by DATA
 func (c *Conn) handleRcpt(arg string) {
-	if !c.fromReceived {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing MAIL FROM command.")
+	// Explicit transaction state gate: RCPT only belongs to a transaction
+	// that has accepted MAIL and is not yet transferring data.
+	switch c.phase {
+	case phaseData:
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
 		return
-	}
-	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
+	case phaseMail, phaseRcpt:
+		// This space is intentionally left blank
+	default:
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing MAIL FROM command.")
 		return
 	}
 
@@ -783,11 +843,15 @@ func (c *Conn) handleRcpt(arg string) {
 		}
 	}
 
+	// A rejected RCPT must not pollute the set of already accepted
+	// recipients: the recipient is only recorded (and the phase only
+	// advances) after the backend accepted it.
 	if err := c.Session().Rcpt(recipient, opts); err != nil {
 		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
 	c.recipients = append(c.recipients, recipient)
+	c.phase = phaseRcpt
 	c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("I'll make sure <%v> gets this", recipient))
 }
 
@@ -817,7 +881,7 @@ func checkNotifySet(values []DSNNotify) error {
 
 func (c *Conn) handleAuth(arg string) {
 	if c.helo == "" {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
 		return
 	}
 	if c.didAuth {
@@ -891,8 +955,8 @@ func (c *Conn) handleAuth(arg string) {
 		}
 	}
 
-	c.writeResponse(235, EnhancedCode{2, 0, 0}, "Authentication succeeded")
 	c.didAuth = true
+	c.writeResponse(235, EnhancedCode{2, 0, 0}, "Authentication succeeded")
 }
 
 func decodeSASLResponse(s string) ([]byte, error) {
@@ -959,22 +1023,24 @@ func (c *Conn) handleData(arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 4}, "DATA command should not have any arguments")
 		return
 	}
-	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "DATA not allowed during message transfer")
+	// Explicit transaction state gate: DATA only delivers the accepted
+	// recipients of the current transaction.
+	if c.phase == phaseData {
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "DATA not allowed during message transfer")
 		return
 	}
 	if c.binarymime {
 		c.writeResponse(502, EnhancedCode{5, 5, 1}, "DATA not allowed for BINARYMIME messages")
 		return
 	}
-
-	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+	if c.phase != phaseRcpt {
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
 		return
 	}
 
 	// We have recipients, go to accept data
 	c.writeResponse(354, NoEnhancedCode, "Go ahead. End your data with <CR><LF>.<CR><LF>")
+	c.phase = phaseData
 
 	defer c.reset()
 
@@ -1001,8 +1067,11 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+	// Explicit transaction state gate: the first BDAT chunk requires an
+	// accepted recipient (RCPT phase), continuation chunks belong to the
+	// DATA phase of the same transaction.
+	if c.phase != phaseRcpt && !(c.phase == phaseData && c.bdatPipe != nil) {
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
 		return
 	}
 
@@ -1040,6 +1109,7 @@ func (c *Conn) handleBdat(arg string) {
 		var r *io.PipeReader
 		r, c.bdatPipe = io.Pipe()
 
+		c.phase = phaseData
 		c.dataResult = make(chan error, 1)
 
 		go func() {
@@ -1332,6 +1402,11 @@ func (c *Conn) readLine() (string, error) {
 	return c.text.ReadLine()
 }
 
+// reset ends the current mail transaction: it clears the transaction
+// identity (reverse-path and accepted recipients) and returns the state
+// machine to the READY phase. The session itself - including its
+// authentication state - is preserved; only Session.Reset of this
+// connection's own session is invoked.
 func (c *Conn) reset() {
 	c.locker.Lock()
 	defer c.locker.Unlock()
@@ -1352,4 +1427,9 @@ func (c *Conn) reset() {
 
 	c.fromReceived = false
 	c.recipients = nil
+	if c.helo == "" {
+		c.phase = phaseGreet
+	} else {
+		c.phase = phaseReady
+	}
 }

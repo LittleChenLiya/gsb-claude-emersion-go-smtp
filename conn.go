@@ -22,6 +22,45 @@ import (
 // Number of errors we'll tolerate per connection before closing. Defaults to 3.
 const errThreshold = 3
 
+// txnPhase identifies the current phase of a mail transaction.
+type txnPhase uint8
+
+const (
+	// txnPhaseGreet: no EHLO/HELO has been accepted yet.
+	txnPhaseGreet txnPhase = iota
+	// txnPhaseReady: EHLO/HELO accepted, no transaction in progress.
+	txnPhaseReady
+	// txnPhaseMail: MAIL FROM accepted, waiting for RCPT TO.
+	txnPhaseMail
+	// txnPhaseRcpt: at least one RCPT TO accepted, DATA/BDAT allowed.
+	txnPhaseRcpt
+	// txnPhaseData: message transfer in progress (DATA or BDAT).
+	txnPhaseData
+)
+
+// transaction tracks the state of a single mail transaction.
+//
+// A transaction is started by MAIL FROM and terminated by RSET, by a new
+// EHLO/HELO, or by the completion of DATA/BDAT. Each transaction is assigned
+// an identity so that RCPT, DATA and BDAT commands are tied to the
+// transaction they belong to.
+//
+// The server only calls backend Session methods while the transaction is in
+// the appropriate phase, and only accepted recipients are recorded, so a
+// failed RCPT cannot pollute the recipients handed to DATA.
+type transaction struct {
+	id    uint64
+	phase txnPhase
+
+	recipients []string
+	rcptOpts   []*RcptOptions
+}
+
+func (t *transaction) addRcpt(rcpt string, opts *RcptOptions) {
+	t.recipients = append(t.recipients, rcpt)
+	t.rcptOpts = append(t.rcptOpts, opts)
+}
+
 type Conn struct {
 	conn   net.Conn
 	text   *textproto.Conn
@@ -41,15 +80,21 @@ type Conn struct {
 	dataResult      chan error
 	bytesReceived   int64 // counts total size of chunks when BDAT is used
 
-	fromReceived bool
-	recipients   []string
-	didAuth      bool
+	// txn is the currently active mail transaction. It is never nil.
+	txn *transaction
+	// txnID is the identity assigned to the next transaction. It is
+	// incremented whenever a new transaction is started.
+	txnID uint64
+	// didAuth reports whether the session has authenticated. It is
+	// session-level state and is not cleared by RSET or a new transaction.
+	didAuth bool
 }
 
 func newConn(c net.Conn, s *Server) *Conn {
 	sc := &Conn{
 		server: s,
 		conn:   c,
+		txn:    &transaction{phase: txnPhaseGreet},
 	}
 
 	sc.init()
@@ -245,6 +290,10 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 		c.setSession(sess)
 	}
 
+	// EHLO/HELO starts a new transaction identity and leaves the connection
+	// ready to accept MAIL FROM. Authentication state is preserved.
+	c.txn.phase = txnPhaseReady
+
 	if !enhanced {
 		c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("Hello %s", domain))
 		return
@@ -316,12 +365,8 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 
 // READY state -> waiting for MAIL
 func (c *Conn) handleMail(arg string) {
-	if c.helo == "" {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
-		return
-	}
-	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
+	if err := c.checkMailAllowed(); err != nil {
+		c.writeError(err.Code, err.EnhancedCode, err)
 		return
 	}
 
@@ -476,8 +521,10 @@ func (c *Conn) handleMail(arg string) {
 		return
 	}
 
+	// MAIL FROM accepted: advance the transaction phase. The backend is only
+	// called after the gate has verified the phase is valid.
+	c.txn.phase = txnPhaseMail
 	c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("Roger, accepting mail from <%v>", from))
-	c.fromReceived = true
 }
 
 // This regexp matches 'hexchar' token defined in
@@ -702,12 +749,8 @@ func isPrintableASCII(val string) bool {
 
 // MAIL state -> waiting for RCPTs followed by DATA
 func (c *Conn) handleRcpt(arg string) {
-	if !c.fromReceived {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing MAIL FROM command.")
-		return
-	}
-	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
+	if err := c.checkRcptAllowed(); err != nil {
+		c.writeError(err.Code, err.EnhancedCode, err)
 		return
 	}
 
@@ -724,7 +767,7 @@ func (c *Conn) handleRcpt(arg string) {
 		return
 	}
 
-	if c.server.MaxRecipients > 0 && len(c.recipients) >= c.server.MaxRecipients {
+	if c.server.MaxRecipients > 0 && len(c.txn.recipients) >= c.server.MaxRecipients {
 		c.writeResponse(452, EnhancedCode{4, 5, 3}, fmt.Sprintf("Maximum limit of %v recipients reached", c.server.MaxRecipients))
 		return
 	}
@@ -784,10 +827,13 @@ func (c *Conn) handleRcpt(arg string) {
 	}
 
 	if err := c.Session().Rcpt(recipient, opts); err != nil {
+		// The recipient was rejected: do not record it and do not advance the
+		// transaction phase, so it cannot pollute the accepted recipients.
 		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
-	c.recipients = append(c.recipients, recipient)
+	c.txn.addRcpt(recipient, opts)
+	c.txn.phase = txnPhaseRcpt
 	c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("I'll make sure <%v> gets this", recipient))
 }
 
@@ -813,6 +859,110 @@ func checkNotifySet(values []DSNNotify) error {
 	}
 
 	return nil
+}
+
+// Phase gate errors. These use the real SMTP reply code for commands issued
+// at the wrong point in the protocol sequence (RFC 5321): 503 Bad sequence
+// of commands.
+var (
+	errNeedHelo = &SMTPError{
+		Code:         503,
+		EnhancedCode: EnhancedCode{5, 5, 1},
+		Message:      "Please introduce yourself first.",
+	}
+	errNeedMail = &SMTPError{
+		Code:         503,
+		EnhancedCode: EnhancedCode{5, 5, 1},
+		Message:      "Missing MAIL FROM command.",
+	}
+	errNeedRcpt = &SMTPError{
+		Code:         503,
+		EnhancedCode: EnhancedCode{5, 5, 1},
+		Message:      "Missing RCPT TO command.",
+	}
+	errBadSequence = &SMTPError{
+		Code:         503,
+		EnhancedCode: EnhancedCode{5, 5, 1},
+		Message:      "Bad sequence of commands",
+	}
+)
+
+// checkMailAllowed gates the MAIL FROM command. MAIL is only valid after
+// EHLO/HELO and before a transaction is started; a duplicate MAIL (with or
+// without RSET in between) is rejected so the backend is never called out of
+// phase.
+func (c *Conn) checkMailAllowed() *SMTPError {
+	switch c.txn.phase {
+	case txnPhaseGreet:
+		return errNeedHelo
+	case txnPhaseReady:
+		return nil
+	default:
+		return errBadSequence
+	}
+}
+
+// checkRcptAllowed gates the RCPT TO command. RCPT is only valid once MAIL
+// FROM has been accepted and before the message transfer (DATA/BDAT) begins.
+func (c *Conn) checkRcptAllowed() *SMTPError {
+	switch c.txn.phase {
+	case txnPhaseGreet:
+		return errNeedHelo
+	case txnPhaseReady:
+		return errNeedMail
+	case txnPhaseMail, txnPhaseRcpt:
+		return nil
+	default:
+		return errBadSequence
+	}
+}
+
+// checkDataAllowed gates the DATA and BDAT commands. The message transfer is
+// only valid once MAIL FROM and at least one RCPT TO have been accepted.
+func (c *Conn) checkDataAllowed() *SMTPError {
+	switch c.txn.phase {
+	case txnPhaseGreet:
+		return errNeedHelo
+	case txnPhaseReady:
+		return errNeedMail
+	case txnPhaseMail:
+		return errNeedRcpt
+	case txnPhaseRcpt:
+		return nil
+	default:
+		return errBadSequence
+	}
+}
+
+// checkBdatAllowed gates the BDAT command. In addition to the phases where a
+// transfer may start (txnPhaseRcpt), BDAT is also accepted while a transfer
+// is already in progress (txnPhaseData) so that subsequent chunks can be
+// sent. DATA is never accepted in txnPhaseData.
+func (c *Conn) checkBdatAllowed() *SMTPError {
+	switch c.txn.phase {
+	case txnPhaseGreet:
+		return errNeedHelo
+	case txnPhaseReady:
+		return errNeedMail
+	case txnPhaseMail:
+		return errNeedRcpt
+	case txnPhaseRcpt, txnPhaseData:
+		return nil
+	default:
+		return errBadSequence
+	}
+}
+
+// TransactionID returns the identity of the current mail transaction. It is
+// 0 before the first EHLO/HELO and changes whenever a new transaction is
+// started (MAIL FROM, RSET, EHLO/HELO, or DATA/BDAT completion).
+func (c *Conn) TransactionID() uint64 {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	if c.txn == nil {
+		return 0
+	}
+	return c.txn.id
 }
 
 func (c *Conn) handleAuth(arg string) {
@@ -951,6 +1101,9 @@ func (c *Conn) handleStartTLS() {
 	c.helo = ""
 	c.didAuth = false
 	c.reset()
+	// After STARTTLS the client must re-EHLO before any transaction command,
+	// so return to the greet phase.
+	c.txn.phase = txnPhaseGreet
 }
 
 // DATA
@@ -959,21 +1112,18 @@ func (c *Conn) handleData(arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 4}, "DATA command should not have any arguments")
 		return
 	}
-	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "DATA not allowed during message transfer")
-		return
-	}
 	if c.binarymime {
 		c.writeResponse(502, EnhancedCode{5, 5, 1}, "DATA not allowed for BINARYMIME messages")
 		return
 	}
-
-	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+	if err := c.checkDataAllowed(); err != nil {
+		c.writeError(err.Code, err.EnhancedCode, err)
 		return
 	}
 
-	// We have recipients, go to accept data
+	// We have recipients, go to accept data. Once DATA begins, the transaction
+	// is in the data phase and duplicate MAIL/RCPT commands are rejected.
+	c.txn.phase = txnPhaseData
 	c.writeResponse(354, NoEnhancedCode, "Go ahead. End your data with <CR><LF>.<CR><LF>")
 
 	defer c.reset()
@@ -1001,8 +1151,8 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+	if err := c.checkBdatAllowed(); err != nil {
+		c.writeError(err.Code, err.EnhancedCode, err)
 		return
 	}
 
@@ -1032,6 +1182,10 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
+	// BDAT accepted: the transaction is now in the data phase, so duplicate
+	// MAIL/RCPT commands are rejected until the transfer completes or is reset.
+	c.txn.phase = txnPhaseData
+
 	if c.bdatStatus == nil && c.server.LMTP {
 		c.bdatStatus = c.createStatusCollector()
 	}
@@ -1059,7 +1213,7 @@ func (c *Conn) handleBdat(arg string) {
 				lmtpSession, ok := c.Session().(LMTPSession)
 				if !ok {
 					err = c.Session().Data(r)
-					for _, rcpt := range c.recipients {
+					for _, rcpt := range c.txn.recipients {
 						c.bdatStatus.SetStatus(rcpt, err)
 					}
 				} else {
@@ -1103,7 +1257,7 @@ func (c *Conn) handleBdat(arg string) {
 
 		if c.server.LMTP {
 			c.bdatStatus.fillRemaining(err)
-			for i, rcpt := range c.recipients {
+			for i, rcpt := range c.txn.recipients {
 				code, enchCode, msg := dataErrorToStatus(<-c.bdatStatus.status[i])
 				c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
 			}
@@ -1142,13 +1296,13 @@ func (c *Conn) handlePanic(err interface{}, status *statusCollector) {
 }
 
 func (c *Conn) createStatusCollector() *statusCollector {
-	rcptCounts := make(map[string]int, len(c.recipients))
+	rcptCounts := make(map[string]int, len(c.txn.recipients))
 
 	status := &statusCollector{
-		statusMap: make(map[string]chan error, len(c.recipients)),
-		status:    make([]chan error, 0, len(c.recipients)),
+		statusMap: make(map[string]chan error, len(c.txn.recipients)),
+		status:    make([]chan error, 0, len(c.txn.recipients)),
 	}
-	for _, rcpt := range c.recipients {
+	for _, rcpt := range c.txn.recipients {
 		rcptCounts[rcpt]++
 	}
 	// Create channels with buffer sizes necessary to fit all
@@ -1156,7 +1310,7 @@ func (c *Conn) createStatusCollector() *statusCollector {
 	for rcpt, count := range rcptCounts {
 		status.statusMap[rcpt] = make(chan error, count)
 	}
-	for _, rcpt := range c.recipients {
+	for _, rcpt := range c.txn.recipients {
 		status.status = append(status.status, status.statusMap[rcpt])
 	}
 
@@ -1217,7 +1371,7 @@ func (c *Conn) handleDataLMTP() {
 		err := c.Session().Data(r)
 		r.limited = false
 		io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
-		for _, rcpt := range c.recipients {
+		for _, rcpt := range c.txn.recipients {
 			status.SetStatus(rcpt, err)
 		}
 		done <- true
@@ -1244,7 +1398,7 @@ func (c *Conn) handleDataLMTP() {
 		}()
 	}
 
-	for i, rcpt := range c.recipients {
+	for i, rcpt := range c.txn.recipients {
 		code, enchCode, msg := dataErrorToStatus(<-status.status[i])
 		c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
 	}
@@ -1350,6 +1504,9 @@ func (c *Conn) reset() {
 		c.session.Reset()
 	}
 
-	c.fromReceived = false
-	c.recipients = nil
+	// Start a fresh transaction with a new identity. This clears the current
+	// transaction (including its accepted recipients) without touching the
+	// session-level authentication state or any other connection's session.
+	c.txnID++
+	c.txn = &transaction{id: c.txnID, phase: txnPhaseReady}
 }

@@ -41,6 +41,28 @@ type Server struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 
+	// StrictDataReader enables strict parsing of the DATA command payload.
+	//
+	// When enabled, the message is read as a sequence of CRLF-terminated
+	// lines: a single leading dot is removed from content lines
+	// (dot-unstuffing, RFC 5321 Section 4.5.2) and the message is
+	// terminated only by a <CRLF>.<CRLF> line, recognized correctly even
+	// when split across multiple network reads. Content lines must end
+	// with CRLF; bare LF is rejected. MaxLineLength is enforced on the
+	// wire form of each content line (before dot-unstuffing, excluding
+	// the terminating CRLF) and MaxMessageBytes is enforced on the
+	// un-stuffed content passed to the backend. Limit violations make
+	// the transaction fail even if the backend does not report an error,
+	// the remainder of the payload is discarded and any pipelined
+	// commands after the terminator stay in the connection reader. A
+	// connection close before the terminator is reported to the backend
+	// as io.ErrUnexpectedEOF and is never treated as a clean end.
+	//
+	// When disabled (the default), the historical lenient reader is
+	// used, which also accepts bare LF line endings and does not enforce
+	// line length limits on the DATA payload.
+	StrictDataReader bool
+
 	// Advertise SMTPUTF8 (RFC 6531) capability.
 	// Should be used only if backend supports it.
 	EnableSMTPUTF8 bool

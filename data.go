@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"io/ioutil"
 )
 
 type EnhancedCode [3]int
@@ -47,15 +48,42 @@ var ErrDataTooLarge = &SMTPError{
 	Message:      "Maximum message size exceeded",
 }
 
-type dataReader struct {
-	r     *bufio.Reader
-	state int
-
-	limited bool
-	n       int64 // Maximum bytes remaining
+// ErrDataLineTooLong is returned by the strict DATA reader when a content
+// line exceeds Server.MaxLineLength bytes. The limit is applied to the
+// wire form of the line, i.e. before dot-unstuffing and excluding the
+// terminating CRLF.
+var ErrDataLineTooLong = &SMTPError{
+	Code:         552,
+	EnhancedCode: EnhancedCode{5, 3, 4},
+	Message:      "Maximum DATA line length exceeded",
 }
 
-func newDataReader(c *Conn) *dataReader {
+// ErrDataBareLF is returned by the strict DATA reader when a content line
+// is terminated by a bare LF instead of a CRLF sequence.
+var ErrDataBareLF = &SMTPError{
+	Code:         554,
+	EnhancedCode: EnhancedCode{5, 6, 0},
+	Message:      "Bare LF in DATA content, lines must end with CRLF",
+}
+
+// dataStream is the common interface of DATA payload readers.
+type dataStream interface {
+	io.Reader
+	// streamErr reports a sticky protocol or limit error encountered while
+	// reading the DATA payload, if any. A clean <CRLF>.<CRLF> termination
+	// is not an error.
+	streamErr() error
+	// drain discards the remainder of the DATA payload, stopping right
+	// after the terminating <CRLF>.<CRLF> so that any pipelined protocol
+	// commands stay in the connection reader.
+	drain()
+}
+
+func newDataReader(c *Conn) dataStream {
+	if c.server.StrictDataReader {
+		return newStrictDataReader(c)
+	}
+
 	dr := &dataReader{
 		r: c.text.R,
 	}
@@ -66,6 +94,26 @@ func newDataReader(c *Conn) *dataReader {
 	}
 
 	return dr
+}
+
+type dataReader struct {
+	r     *bufio.Reader
+	state int
+
+	limited bool
+	n       int64 // Maximum bytes remaining
+}
+
+// streamErr implements dataStream. The lenient reader does not track
+// stream errors and always reports nil.
+func (r *dataReader) streamErr() error {
+	return nil
+}
+
+// drain implements dataStream.
+func (r *dataReader) drain() {
+	r.limited = false
+	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
 }
 
 func (r *dataReader) Read(b []byte) (n int, err error) {
@@ -145,4 +193,150 @@ func (r *dataReader) Read(b []byte) (n int, err error) {
 		r.n -= int64(n)
 	}
 	return
+}
+
+// strictDataReader reads a DATA payload as a sequence of CRLF-terminated
+// lines, applying RFC 5321 Section 4.5.2 dot-transparency strictly:
+//
+//   - The message is terminated only by a <CRLF>.<CRLF> line. The
+//     terminator is recognized correctly even when the CR, LF or dot are
+//     split across multiple underlying reads.
+//   - A single leading dot is removed from every content line
+//     (dot-unstuffing), so "..hello" is delivered as ".hello".
+//   - Content lines must end with CRLF; a bare LF is rejected with
+//     ErrDataBareLF.
+//   - Server.MaxLineLength is enforced on the wire form of each content
+//     line: before dot-unstuffing and excluding the terminating CRLF.
+//     Violations are reported as ErrDataLineTooLong.
+//   - Server.MaxMessageBytes is enforced on the un-stuffed content bytes
+//     delivered to the backend. Violations are reported as
+//     ErrDataTooLarge.
+//   - A connection close before the terminating <CRLF>.<CRLF> is a short
+//     EOF and is reported as io.ErrUnexpectedEOF, never as a clean end.
+//   - Bytes following the terminator (e.g. pipelined commands) are never
+//     consumed and stay in the connection reader.
+type strictDataReader struct {
+	r *bufio.Reader
+
+	lineLimit int // Maximum wire length of a content line, excluding CRLF. 0 = unlimited.
+
+	limited bool
+	n       int64 // Maximum un-stuffed content bytes remaining.
+
+	line []byte // Scratch buffer for the current wire line.
+	buf  []byte // Un-stuffed bytes pending delivery.
+
+	done bool   // Terminating <CRLF>.<CRLF> consumed.
+	err  error  // Sticky stream error.
+}
+
+func newStrictDataReader(c *Conn) *strictDataReader {
+	dr := &strictDataReader{
+		r:         c.text.R,
+		lineLimit: c.server.MaxLineLength,
+	}
+
+	if c.server.MaxMessageBytes > 0 {
+		dr.limited = true
+		dr.n = int64(c.server.MaxMessageBytes)
+	}
+
+	return dr
+}
+
+func (r *strictDataReader) Read(b []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	for len(r.buf) == 0 {
+		if r.done {
+			return 0, io.EOF
+		}
+		if err := r.nextLine(); err != nil {
+			r.err = err
+			return 0, err
+		}
+	}
+
+	if r.limited {
+		if r.n <= 0 {
+			r.err = ErrDataTooLarge
+			return 0, r.err
+		}
+		if int64(len(b)) > r.n {
+			b = b[0:r.n]
+		}
+	}
+
+	n := copy(b, r.buf)
+	r.buf = r.buf[n:]
+
+	if r.limited {
+		r.n -= int64(n)
+	}
+	return n, nil
+}
+
+// nextLine reads a single wire line, detects the terminator and unstuffs
+// content lines into r.buf.
+func (r *strictDataReader) nextLine() error {
+	r.line = r.line[:0]
+	for {
+		c, err := r.r.ReadByte()
+		if err != nil {
+			if err == io.EOF {
+				// Short EOF: the connection was closed before the
+				// terminating <CRLF>.<CRLF>, this is not a clean end.
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
+		r.line = append(r.line, c)
+		// The wire line may carry at most 2 extra bytes for the
+		// terminating CRLF, anything beyond the limit plus that is
+		// definitely too long.
+		if r.lineLimit > 0 && len(r.line) > r.lineLimit+2 {
+			return ErrDataLineTooLong
+		}
+		if c == '\n' {
+			break
+		}
+	}
+
+	line := r.line
+	if len(line) < 2 || line[len(line)-2] != '\r' {
+		return ErrDataBareLF
+	}
+	content := line[:len(line)-2]
+
+	if len(content) == 1 && content[0] == '.' {
+		// <CRLF>.<CRLF> end-of-data marker.
+		r.done = true
+		return nil
+	}
+	if len(content) > 0 && content[0] == '.' {
+		// Dot-stuffed line: remove exactly one leading dot.
+		content = content[1:]
+	}
+
+	out := make([]byte, 0, len(content)+2)
+	out = append(out, content...)
+	out = append(out, '\r', '\n')
+	r.buf = out
+	return nil
+}
+
+// streamErr implements dataStream.
+func (r *strictDataReader) streamErr() error {
+	return r.err
+}
+
+// drain implements dataStream. Limits and the sticky error are lifted so
+// that the remainder of the payload can be discarded; reading stops right
+// after the terminating <CRLF>.<CRLF>.
+func (r *strictDataReader) drain() {
+	r.limited = false
+	r.lineLimit = 0
+	r.err = nil
+	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
 }

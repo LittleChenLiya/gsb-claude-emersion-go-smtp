@@ -978,15 +978,28 @@ func (c *Conn) handleData(arg string) {
 
 	defer c.reset()
 
+	if c.server.StrictDataReader {
+		// The strict DATA reader enforces content line lengths itself,
+		// disable the generic connection line limit while DATA is read.
+		// The deferred reset restores it.
+		c.lineLimitReader.LineLimit = 0
+	}
+
 	if c.server.LMTP {
 		c.handleDataLMTP()
 		return
 	}
 
 	r := newDataReader(c)
-	code, enhancedCode, msg := dataErrorToStatus(c.Session().Data(r))
-	r.limited = false
-	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+	err := c.Session().Data(r)
+	if streamErr := r.streamErr(); err == nil && streamErr != nil {
+		// The payload hit a limit or protocol error (e.g. too long line,
+		// short EOF) but the backend did not report it: the transaction
+		// must not be marked as successful.
+		err = streamErr
+	}
+	r.drain() // Make sure all the data has been consumed
+	code, enhancedCode, msg := dataErrorToStatus(err)
 	c.writeResponse(code, enhancedCode, msg)
 }
 
@@ -1215,8 +1228,10 @@ func (c *Conn) handleDataLMTP() {
 	if !ok {
 		// Fallback to using a single status for all recipients.
 		err := c.Session().Data(r)
-		r.limited = false
-		io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+		if streamErr := r.streamErr(); err == nil && streamErr != nil {
+			err = streamErr
+		}
+		r.drain() // Make sure all the data has been consumed
 		for _, rcpt := range c.recipients {
 			status.SetStatus(rcpt, err)
 		}
@@ -1237,9 +1252,12 @@ func (c *Conn) handleDataLMTP() {
 				}
 			}()
 
-			status.fillRemaining(lmtpSession.LMTPData(r, status))
-			r.limited = false
-			io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+			err := lmtpSession.LMTPData(r, status)
+			if streamErr := r.streamErr(); err == nil && streamErr != nil {
+				err = streamErr
+			}
+			status.fillRemaining(err)
+			r.drain() // Make sure all the data has been consumed
 			done <- true
 		}()
 	}

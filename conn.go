@@ -983,9 +983,13 @@ func (c *Conn) handleData(arg string) {
 		return
 	}
 
-	r := newDataReader(c)
+	r := newMessageReader(c)
 	code, enhancedCode, msg := dataErrorToStatus(c.Session().Data(r))
-	r.limited = false
+	// Controlled transaction cleanup: consume the rest of the message up
+	// to and including the terminator, even if the backend failed or a
+	// limit was exceeded. Commands pipelined after the message (e.g.
+	// NOOP) stay in the connection reader and are handled as commands.
+	r.drainMode()
 	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
 	c.writeResponse(code, enhancedCode, msg)
 }
@@ -1206,7 +1210,7 @@ func (s *statusCollector) SetStatus(rcptTo string, err error) {
 }
 
 func (c *Conn) handleDataLMTP() {
-	r := newDataReader(c)
+	r := newMessageReader(c)
 	status := c.createStatusCollector()
 
 	done := make(chan bool, 1)
@@ -1215,7 +1219,7 @@ func (c *Conn) handleDataLMTP() {
 	if !ok {
 		// Fallback to using a single status for all recipients.
 		err := c.Session().Data(r)
-		r.limited = false
+		r.drainMode()
 		io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
 		for _, rcpt := range c.recipients {
 			status.SetStatus(rcpt, err)
@@ -1238,7 +1242,7 @@ func (c *Conn) handleDataLMTP() {
 			}()
 
 			status.fillRemaining(lmtpSession.LMTPData(r, status))
-			r.limited = false
+			r.drainMode()
 			io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
 			done <- true
 		}()

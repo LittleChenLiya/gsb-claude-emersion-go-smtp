@@ -41,6 +41,17 @@ type Server struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 
+	// StrictDataReader enables strict parsing of the DATA command
+	// payload: <CRLF>.<CRLF> terminator detection (even when split
+	// across input chunks), dot-stuffing reversal, rejection of invalid
+	// single-dot lines, enforcement of MaxLineLength on content lines
+	// (counted on the wire form, before dot-unstuffing, excluding the
+	// CRLF) and controlled transaction cleanup when the backend fails.
+	//
+	// When disabled (the default), the historical lenient DATA reader
+	// is used.
+	StrictDataReader bool
+
 	// Advertise SMTPUTF8 (RFC 6531) capability.
 	// Should be used only if backend supports it.
 	EnableSMTPUTF8 bool

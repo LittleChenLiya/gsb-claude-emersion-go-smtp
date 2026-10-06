@@ -11,6 +11,38 @@ An ESMTP client and server library written in Go.
 * UTF-8 support for subject and message
 * [LMTP] support
 
+## Client capability snapshots
+
+The client exposes the EHLO capabilities confirmed for the current session as
+an explicit, immutable snapshot (`Client.Capabilities`). A mail transaction is
+bound to the snapshot taken at MAIL time (`Client.TransactionCapabilities`):
+every command of the transaction uses exactly those capabilities, and later
+changes to the shared capability map cannot leak into it. The snapshot records
+the session phase (plaintext or post-STARTTLS) but never stores authentication
+values.
+
+A successful STARTTLS invalidates all previously confirmed capabilities: until
+a new EHLO completes, neither AUTH nor SMTPUTF8 (nor any other extension) is
+considered available, and a failed EHLO is never marked ready and never lets
+the client enter MAIL.
+
+The canonical STARTTLS workflow uses five commands:
+
+```
+EHLO      ; confirm pre-TLS capabilities (e.g. STARTTLS, SMTPUTF8)
+STARTTLS  ; invalidate them
+EHLO      ; confirm post-TLS capabilities on the encrypted connection
+MAIL      ; bind the transaction to the post-TLS snapshot
+QUIT
+```
+
+Run the capability snapshot acceptance tests (scripted local connections
+only) with:
+
+```
+go test -run 'TestClientCapabilitySnapshot' .
+```
+
 ## Relationship with net/smtp
 
 The Go standard library provides a SMTP client implementation in `net/smtp`.

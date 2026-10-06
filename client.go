@@ -28,13 +28,16 @@ type Client struct {
 	text       *textproto.Conn
 	serverName string
 	lmtp       bool
-	ext        map[string]string // supported extensions
-	localName  string            // the name to use in HELO/EHLO/LHLO
-	didGreet   bool              // whether we've received greeting from server
-	greetError error             // the error from the greeting
-	didHello   bool              // whether we've said HELO/EHLO/LHLO
-	helloError error             // the error from the hello
-	rcpts      []string          // recipients accumulated for the current transaction
+	ext        map[string]string   // supported extensions
+	localName  string              // the name to use in HELO/EHLO/LHLO
+	didGreet   bool                // whether we've received greeting from server
+	greetError error               // the error from the greeting
+	didHello   bool                // whether we've said HELO/EHLO/LHLO
+	helloError error               // the error from the hello
+	helloGen   uint64              // generation of the last capability confirmation
+	capsStale  bool                // whether ext was invalidated (STARTTLS or failed EHLO)
+	txCaps     *CapabilitySnapshot // snapshot bound to the current transaction
+	rcpts      []string            // recipients accumulated for the current transaction
 
 	// Time to wait for command responses (this includes 3xx reply to DATA).
 	CommandTimeout time.Duration
@@ -270,7 +273,12 @@ func (c *Client) cmd(expectCode int, format string, args ...interface{}) (int, s
 func (c *Client) helo() error {
 	c.ext = nil
 	_, _, err := c.cmd(250, "HELO %s", c.localName)
-	return err
+	if err != nil {
+		return err
+	}
+	c.helloGen++
+	c.capsStale = false
+	return nil
 }
 
 // ehlo sends the EHLO (extended hello) greeting to the server. It
@@ -283,6 +291,10 @@ func (c *Client) ehlo() error {
 
 	_, msg, err := c.cmd(250, "%s %s", cmd, c.localName)
 	if err != nil {
+		// A failed EHLO invalidates the previously confirmed
+		// capabilities: they must not be marked ready.
+		c.ext = nil
+		c.capsStale = true
 		return err
 	}
 	ext := make(map[string]string)
@@ -299,7 +311,9 @@ func (c *Client) ehlo() error {
 		}
 	}
 	c.ext = ext
-	return err
+	c.helloGen++
+	c.capsStale = false
+	return nil
 }
 
 // startTLS sends the STARTTLS command and encrypts all further communication.
@@ -329,6 +343,13 @@ func (c *Client) startTLS(config *tls.Config) error {
 	}
 	c.setConn(tls.Client(c.conn, config))
 	c.didHello = false
+	// The capabilities confirmed before STARTTLS are no longer valid:
+	// they must be re-confirmed with a new EHLO on the encrypted
+	// connection before they (e.g. AUTH or SMTPUTF8) may be used again.
+	c.ext = nil
+	c.capsStale = true
+	c.helloGen++
+	c.txCaps = nil
 	return nil
 }
 
@@ -431,31 +452,36 @@ func (c *Client) Mail(from string, opts *MailOptions) error {
 		return err
 	}
 
+	// Take an explicit snapshot of the capabilities confirmed for this
+	// session. The whole mail transaction is bound to it: later changes
+	// to the shared capability map cannot leak into the transaction.
+	caps := c.snapshotCaps()
+
 	var sb strings.Builder
 	// A high enough power of 2 than 510+14+26+11+9+9+39+500
 	sb.Grow(2048)
 	fmt.Fprintf(&sb, "MAIL FROM:<%s>", from)
-	if _, ok := c.ext["8BITMIME"]; ok {
+	if _, ok := caps.ext["8BITMIME"]; ok {
 		sb.WriteString(" BODY=8BITMIME")
 	}
-	if _, ok := c.ext["SIZE"]; ok && opts != nil && opts.Size != 0 {
+	if _, ok := caps.ext["SIZE"]; ok && opts != nil && opts.Size != 0 {
 		fmt.Fprintf(&sb, " SIZE=%v", opts.Size)
 	}
 	if opts != nil && opts.RequireTLS {
-		if _, ok := c.ext["REQUIRETLS"]; ok {
+		if _, ok := caps.ext["REQUIRETLS"]; ok {
 			sb.WriteString(" REQUIRETLS")
 		} else {
 			return errors.New("smtp: server does not support REQUIRETLS")
 		}
 	}
 	if opts != nil && opts.UTF8 {
-		if _, ok := c.ext["SMTPUTF8"]; ok {
+		if _, ok := caps.ext["SMTPUTF8"]; ok {
 			sb.WriteString(" SMTPUTF8")
 		} else {
 			return errors.New("smtp: server does not support SMTPUTF8")
 		}
 	}
-	if _, ok := c.ext["DSN"]; ok && opts != nil {
+	if _, ok := caps.ext["DSN"]; ok && opts != nil {
 		switch opts.Return {
 		case DSNReturnFull, DSNReturnHeaders:
 			fmt.Fprintf(&sb, " RET=%s", string(opts.Return))
@@ -472,12 +498,12 @@ func (c *Client) Mail(from string, opts *MailOptions) error {
 		}
 	}
 	if opts != nil && opts.Auth != nil {
-		if _, ok := c.ext["AUTH"]; ok {
+		if _, ok := caps.ext["AUTH"]; ok {
 			fmt.Fprintf(&sb, " AUTH=%s", encodeXtext(*opts.Auth))
 		}
 		// We can safely discard parameter if server does not support AUTH.
 	}
-	if _, ok := c.ext["DELIVERBY"]; ok && opts != nil && opts.DeliverBy != nil {
+	if _, ok := caps.ext["DELIVERBY"]; ok && opts != nil && opts.DeliverBy != nil {
 		by := int(opts.DeliverBy.Time.Seconds())
 		// Specified in rfc2852
 		// by-time      = ["-" / "+"]1*9digit ; a negative or zero value is not
@@ -494,18 +520,21 @@ func (c *Client) Mail(from string, opts *MailOptions) error {
 		}
 		sb.WriteString(arg)
 	}
-	if _, ok := c.ext["MT-PRIORITY"]; ok && opts != nil && opts.MTPriority != nil {
+	if _, ok := caps.ext["MT-PRIORITY"]; ok && opts != nil && opts.MTPriority != nil {
 		if *opts.MTPriority < -9 || *opts.MTPriority > 9 {
 			return errors.New("smtp: MT-PRIORITY must be between -9 and 9")
 		}
 		sb.WriteString(fmt.Sprintf(" MT-PRIORITY=%d", *opts.MTPriority))
 	}
 	if _, _, err := c.cmd(250, "%s", sb.String()); err != nil {
+		c.txCaps = nil
 		return err
 	}
 
-	// A new transaction has started, forget the previous recipients.
+	// A new transaction has started, forget the previous recipients and
+	// bind the transaction identity to the capability snapshot.
 	c.rcpts = nil
+	c.txCaps = caps
 
 	return nil
 }
@@ -523,11 +552,19 @@ func (c *Client) Rcpt(to string, opts *RcptOptions) error {
 		return err
 	}
 
+	// Use the capability snapshot bound to the current mail transaction
+	// if there is one, so the whole transaction consistently uses the
+	// capabilities confirmed at MAIL time.
+	caps := c.txCaps
+	if caps == nil {
+		caps = c.snapshotCaps()
+	}
+
 	var sb strings.Builder
 	// A high enough power of 2 than 510+29+501
 	sb.Grow(2048)
 	fmt.Fprintf(&sb, "RCPT TO:<%s>", to)
-	if _, ok := c.ext["DSN"]; ok && opts != nil {
+	if _, ok := caps.ext["DSN"]; ok && opts != nil {
 		if len(opts.Notify) != 0 {
 			sb.WriteString(" NOTIFY=")
 			if err := checkNotifySet(opts.Notify); err != nil {
@@ -549,7 +586,7 @@ func (c *Client) Rcpt(to string, opts *RcptOptions) error {
 				}
 				enc = encodeXtext(opts.OriginalRecipient)
 			case DSNAddressTypeUTF8:
-				if _, ok := c.ext["SMTPUTF8"]; ok {
+				if _, ok := caps.ext["SMTPUTF8"]; ok {
 					enc = encodeUTF8AddrUnitext(opts.OriginalRecipient)
 				} else {
 					enc = encodeUTF8AddrXtext(opts.OriginalRecipient)
@@ -560,7 +597,7 @@ func (c *Client) Rcpt(to string, opts *RcptOptions) error {
 			fmt.Fprintf(&sb, " ORCPT=%s;%s", string(opts.OriginalRecipientType), enc)
 		}
 	}
-	if _, ok := c.ext["RRVS"]; ok && opts != nil && !opts.RequireRecipientValidSince.IsZero() {
+	if _, ok := caps.ext["RRVS"]; ok && opts != nil && !opts.RequireRecipientValidSince.IsZero() {
 		sb.WriteString(fmt.Sprintf(" RRVS=%s", opts.RequireRecipientValidSince.Format(time.RFC3339)))
 	}
 	if _, _, err := c.cmd(25, "%s", sb.String()); err != nil {
@@ -884,6 +921,7 @@ func (c *Client) Reset() error {
 	c.didHello = false
 	c.helloError = nil
 
+	c.txCaps = nil
 	c.rcpts = nil
 	return nil
 }

@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/textproto"
@@ -1183,11 +1184,13 @@ var dsnServer = `220 hello world
 250 ok
 250 ok
 250 ok
+250 ok
 `
 
 var dsnClient = `MAIL FROM:<e=mc2@example.com> RET=HDRS ENVID=e+3Dmc2
 RCPT TO:<e=mc2@example.com> NOTIFY=NEVER ORCPT=RFC822;e+3Dmc2@example.com
 RCPT TO:<e=mc2@example.com> NOTIFY=FAILURE,DELAY ORCPT=UTF-8;e\x{3D}mc2@\x{30C9}\x{30E1}\x{30A4}\x{30F3}\x{540D}\x{4F8B}.jp
+MAIL FROM:<e=mc2@example.com>
 RCPT TO:<e=mc2@ドメイン名例.jp> ORCPT=UTF-8;e\x{3D}mc2@ドメイン名例.jp
 `
 
@@ -1222,6 +1225,10 @@ func TestClientDSN(t *testing.T) {
 		Notify:                []DSNNotify{DSNNotifyFailure, DSNNotifyDelayed},
 	})
 	c.ext["SMTPUTF8"] = ""
+	// The mutation above is not part of the snapshot bound to the current
+	// transaction. A new MAIL command starts a new transaction and binds
+	// a fresh snapshot, which now includes SMTPUTF8.
+	c.Mail(dsnEmailRFC822, nil)
 	c.Rcpt(dsnEmailUTF8, &RcptOptions{
 		OriginalRecipientType: DSNAddressTypeUTF8,
 		OriginalRecipient:     dsnEmailUTF8,
@@ -1333,5 +1340,251 @@ func TestClientMTPRIORITY(t *testing.T) {
 	c.Close()
 	if actualcmds := wrote.String(); client != actualcmds {
 		t.Errorf("wrote %q; want %q", actualcmds, client)
+	}
+}
+
+// capSnapshotServerScript is a scripted local SMTP server used by
+// TestClientCapabilitySnapshotSTARTTLS. Pre-TLS it advertises STARTTLS,
+// AUTH and SMTPUTF8; post-TLS it advertises neither AUTH nor SMTPUTF8.
+// Any unexpected command (in particular a MAIL carrying SMTPUTF8) is a
+// script violation and fails the test.
+func capSnapshotServerScript(conn net.Conn) error {
+	send := smtpSender{conn}.send
+	expect := func(s *bufio.Scanner, want string) error {
+		if !s.Scan() {
+			if err := s.Err(); err != nil {
+				return err
+			}
+			return errors.New("connection closed unexpectedly")
+		}
+		if got := s.Text(); got != want {
+			return fmt.Errorf("got command %q, want %q", got, want)
+		}
+		return nil
+	}
+
+	send("220 127.0.0.1 ESMTP service ready")
+	s := bufio.NewScanner(conn)
+	if err := expect(s, "EHLO localhost"); err != nil {
+		return err
+	}
+	send("250-127.0.0.1 greets you")
+	send("250-STARTTLS")
+	send("250-AUTH PLAIN")
+	send("250 SMTPUTF8")
+	if err := expect(s, "STARTTLS"); err != nil {
+		return err
+	}
+	send("220 Go ahead")
+
+	keypair, err := tls.X509KeyPair(localhostCert, localhostKey)
+	if err != nil {
+		return err
+	}
+	tlsConn := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{keypair}})
+	defer tlsConn.Close()
+
+	send = smtpSender{tlsConn}.send
+	s = bufio.NewScanner(tlsConn)
+	if err := expect(s, "EHLO localhost"); err != nil {
+		return err
+	}
+	send("250-8BITMIME")
+	send("250 SIZE 1024")
+	if err := expect(s, "QUIT"); err != nil {
+		return err
+	}
+	send("221 Bye")
+	return nil
+}
+
+// Five-command scripted workflow: EHLO, STARTTLS, EHLO, MAIL, QUIT.
+// The pre-TLS EHLO confirms SMTPUTF8, the post-TLS EHLO does not, so the
+// client must not carry the old capability over into MAIL.
+func TestClientCapabilitySnapshotSTARTTLS(t *testing.T) {
+	ln := newLocalListener(t)
+	defer ln.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		errCh <- capSnapshotServerScript(conn)
+	}()
+
+	cfg := &tls.Config{ServerName: "example.com"}
+	testHookStartTLS(cfg) // set the RootCAs
+
+	c, err := Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	// 1. EHLO (plaintext): SMTPUTF8 and AUTH are confirmed.
+	if err := c.Hello("localhost"); err != nil {
+		t.Fatalf("Hello: %v", err)
+	}
+	pre := c.Capabilities()
+	if !pre.Ready() || pre.TLS() {
+		t.Errorf("pre-TLS snapshot: ready=%v tls=%v, want ready non-TLS", pre.Ready(), pre.TLS())
+	}
+	if ok, _ := pre.Extension("SMTPUTF8"); !ok {
+		t.Errorf("pre-TLS snapshot lacks SMTPUTF8")
+	}
+	if !pre.SupportsAuth("PLAIN") {
+		t.Errorf("pre-TLS snapshot lacks AUTH PLAIN")
+	}
+
+	// 2. STARTTLS: previously confirmed capabilities are invalidated.
+	if err := c.startTLS(cfg); err != nil {
+		t.Fatalf("STARTTLS: %v", err)
+	}
+	mid := c.Capabilities()
+	if mid.Ready() {
+		t.Errorf("post-STARTTLS snapshot is ready before the new EHLO completes")
+	}
+	if ok, _ := mid.Extension("SMTPUTF8"); ok {
+		t.Errorf("stale SMTPUTF8 capability survived STARTTLS")
+	}
+	if mid.SupportsAuth("PLAIN") {
+		t.Errorf("stale AUTH capability survived STARTTLS")
+	}
+
+	// 3. EHLO again (encrypted): the server no longer advertises
+	// SMTPUTF8 or AUTH.
+	if err := c.Hello("localhost"); err != nil {
+		t.Fatalf("post-TLS Hello: %v", err)
+	}
+	post := c.Capabilities()
+	if !post.Ready() || !post.TLS() {
+		t.Errorf("post-TLS snapshot: ready=%v tls=%v, want ready TLS", post.Ready(), post.TLS())
+	}
+	if post.ID() == pre.ID() {
+		t.Errorf("snapshot identity did not change across STARTTLS")
+	}
+	if ok, _ := post.Extension("SMTPUTF8"); ok {
+		t.Fatalf("scripted server unexpectedly still advertises SMTPUTF8")
+	}
+	if post.SupportsAuth("PLAIN") {
+		t.Errorf("post-TLS snapshot carries stale AUTH PLAIN")
+	}
+	// The pre-TLS snapshot is immutable history.
+	if ok, _ := pre.Extension("SMTPUTF8"); !ok {
+		t.Errorf("pre-TLS snapshot was mutated by STARTTLS")
+	}
+
+	// 4. MAIL with UTF8 must be refused locally: the old SMTPUTF8
+	// capability must not be carried over, and MAIL must not be sent.
+	err = c.Mail("user@example.com", &MailOptions{UTF8: true})
+	if err == nil || !strings.Contains(err.Error(), "SMTPUTF8") {
+		t.Errorf("Mail with UTF8 after STARTTLS: got %v, want SMTPUTF8 error", err)
+	}
+	if c.TransactionCapabilities() != nil {
+		t.Errorf("transaction bound despite refused MAIL")
+	}
+
+	// 5. QUIT.
+	if err := c.Quit(); err != nil {
+		t.Fatalf("Quit: %v", err)
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("scripted server: %v", err)
+	}
+}
+
+// A failed EHLO must not be marked ready and must not let the client
+// enter MAIL.
+func TestClientCapabilitySnapshotEHLOFailure(t *testing.T) {
+	server := "220 hello world\r\n" +
+		"554 Service unavailable\r\n"
+
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	defer c.Close()
+
+	if err := c.Mail("user@example.com", nil); err == nil {
+		t.Fatal("Mail: expected error after failed EHLO, got nil")
+	}
+	if got := wrote.String(); strings.Contains(got, "MAIL") {
+		t.Errorf("client entered MAIL despite failed EHLO:\n%s", got)
+	}
+
+	snap := c.Capabilities()
+	if snap.Ready() {
+		t.Errorf("snapshot marked ready after failed EHLO")
+	}
+	if ok, _ := snap.Extension("SMTPUTF8"); ok {
+		t.Errorf("failed EHLO produced capabilities")
+	}
+	if c.TransactionCapabilities() != nil {
+		t.Errorf("transaction bound without a successful MAIL")
+	}
+}
+
+// A mail transaction is bound to the capability snapshot taken at MAIL
+// time: mutating the shared capability map afterwards must not leak into
+// the ongoing transaction.
+func TestClientCapabilitySnapshotTransactionBinding(t *testing.T) {
+	server := strings.Join(strings.Split(`220 hello world
+250-localhost greets you
+250-DSN
+250 SMTPUTF8
+250 Sender ok
+250 Receiver ok
+`, "\n"), "\r\n")
+	want := "EHLO localhost\r\n" +
+		"MAIL FROM:<user@example.com> SMTPUTF8\r\n" +
+		"RCPT TO:<dest@example.com> NOTIFY=SUCCESS\r\n"
+
+	var cmdbuf bytes.Buffer
+	bcmdbuf := bufio.NewWriter(&cmdbuf)
+	var fake faker
+	fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
+	c := NewClient(fake)
+	defer c.Close()
+
+	if err := c.Mail("user@example.com", &MailOptions{UTF8: true}); err != nil {
+		t.Fatalf("Mail: %v", err)
+	}
+	tx := c.TransactionCapabilities()
+	if tx == nil {
+		t.Fatal("no capability snapshot bound to the transaction")
+	}
+	if tx.ID() != c.Capabilities().ID() {
+		t.Errorf("transaction snapshot ID %d != session snapshot ID %d", tx.ID(), c.Capabilities().ID())
+	}
+
+	// Mutate the shared capability map after MAIL: the bound transaction
+	// must keep using the capabilities confirmed at MAIL time.
+	delete(c.ext, "DSN")
+	delete(c.ext, "SMTPUTF8")
+
+	if err := c.Rcpt("dest@example.com", &RcptOptions{Notify: []DSNNotify{DSNNotifySuccess}}); err != nil {
+		t.Fatalf("Rcpt: %v", err)
+	}
+	if ok, _ := tx.Extension("DSN"); !ok {
+		t.Errorf("bound snapshot lost DSN after shared map mutation")
+	}
+	if ok, _ := c.Capabilities().Extension("DSN"); ok {
+		t.Errorf("fresh snapshot should reflect the mutated shared map")
+	}
+
+	bcmdbuf.Flush()
+	if got := cmdbuf.String(); got != want {
+		t.Errorf("got commands:\n%s\nwant:\n%s", got, want)
 	}
 }

@@ -84,3 +84,38 @@ func ExampleSendMail() {
 		log.Fatal(err)
 	}
 }
+
+// ExampleClient_Capabilities demonstrates the explicit EHLO capability
+// snapshot workflow over STARTTLS with five commands: EHLO, STARTTLS,
+// EHLO, MAIL and QUIT.
+func ExampleClient_Capabilities() {
+	// Commands 1-2: EHLO and STARTTLS are issued by DialStartTLS. The
+	// capabilities confirmed before STARTTLS are invalidated by it.
+	c, err := smtp.DialStartTLS("mail.example.com:25", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Command 3: EHLO again on the encrypted connection. Until it
+	// completes, previously confirmed capabilities (such as AUTH or
+	// SMTPUTF8) must not be relied upon.
+	if err := c.Hello("localhost"); err != nil {
+		log.Fatal(err)
+	}
+	caps := c.Capabilities()
+	utf8 := false
+	if ok, _ := caps.Extension("SMTPUTF8"); ok {
+		utf8 = true
+	}
+
+	// Command 4: MAIL binds the transaction to the snapshot confirmed
+	// above; later capability changes cannot leak into the transaction.
+	if err := c.Mail(from, &smtp.MailOptions{UTF8: utf8}); err != nil {
+		log.Fatal(err)
+	}
+
+	// Command 5: QUIT.
+	if err := c.Quit(); err != nil {
+		log.Fatal(err)
+	}
+}

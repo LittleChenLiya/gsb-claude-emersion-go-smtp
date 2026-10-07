@@ -36,6 +36,23 @@ type Server struct {
 	MaxMessageBytes   int64
 	MaxLineLength     int
 	AllowInsecureAuth bool
+
+	// Reset the transaction state after a failed AUTH attempt.
+	//
+	// When enabled, any temporary state accumulated during a failed
+	// authentication round is discarded (as if RSET had been issued)
+	// before the failure response is sent. This isolates subsequent
+	// commands from the failed AUTH command: no partial authentication
+	// state can leak into the following transaction and the client may
+	// re-negotiate with EHLO and retry AUTH. Already authenticated
+	// sessions are not affected: further AUTH attempts are rejected
+	// with 503 without touching any session state, so an authenticated
+	// session cannot be silently downgraded by a failed attempt.
+	//
+	// When disabled (the default), the historical behavior is kept and
+	// no state cleanup is performed on authentication failure.
+	AuthFailureReset bool
+
 	Debug             io.Writer
 	ErrorLog          Logger
 	ReadTimeout       time.Duration

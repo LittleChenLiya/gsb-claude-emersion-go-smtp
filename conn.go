@@ -821,6 +821,9 @@ func (c *Conn) handleAuth(arg string) {
 		return
 	}
 	if c.didAuth {
+		// An authenticated session must not be silently downgraded by
+		// another authentication attempt: reject it before touching any
+		// session or transaction state.
 		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Already authenticated")
 		return
 	}
@@ -844,6 +847,7 @@ func (c *Conn) handleAuth(arg string) {
 		var err error
 		ir, err = decodeSASLResponse(parts[1])
 		if err != nil {
+			c.authFailureCleanup()
 			c.writeResponse(454, EnhancedCode{4, 7, 0}, "Invalid base64 data")
 			return
 		}
@@ -851,6 +855,7 @@ func (c *Conn) handleAuth(arg string) {
 
 	sasl, err := c.auth(mechanism)
 	if err != nil {
+		c.authFailureCleanup()
 		c.writeError(454, EnhancedCode{4, 7, 0}, err)
 		return
 	}
@@ -859,6 +864,7 @@ func (c *Conn) handleAuth(arg string) {
 	for {
 		challenge, done, err := sasl.Next(response)
 		if err != nil {
+			c.authFailureCleanup()
 			c.writeError(454, EnhancedCode{4, 7, 0}, err)
 			return
 		}
@@ -880,12 +886,14 @@ func (c *Conn) handleAuth(arg string) {
 
 		if encoded == "*" {
 			// https://tools.ietf.org/html/rfc4954#page-4
+			c.authFailureCleanup()
 			c.writeResponse(501, EnhancedCode{5, 0, 0}, "Negotiation cancelled")
 			return
 		}
 
 		response, err = decodeSASLResponse(encoded)
 		if err != nil {
+			c.authFailureCleanup()
 			c.writeResponse(454, EnhancedCode{4, 7, 0}, "Invalid base64 data")
 			return
 		}
@@ -893,6 +901,21 @@ func (c *Conn) handleAuth(arg string) {
 
 	c.writeResponse(235, EnhancedCode{2, 0, 0}, "Authentication succeeded")
 	c.didAuth = true
+}
+
+// authFailureCleanup discards the temporary transaction state that a
+// failed authentication round may have accumulated, if enabled via
+// Server.AuthFailureReset. It is only invoked for connections that are
+// not authenticated yet, so an established authenticated session is
+// never reset (i.e. downgraded) by a failed AUTH attempt.
+func (c *Conn) authFailureCleanup() {
+	if !c.server.AuthFailureReset {
+		return
+	}
+	// Clear the transaction state (as RSET does) so that the failed
+	// AUTH command is isolated from subsequent commands: the client
+	// may issue EHLO to re-negotiate and retry AUTH from a clean state.
+	c.reset()
 }
 
 func decodeSASLResponse(s string) ([]byte, error) {

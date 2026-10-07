@@ -44,6 +44,12 @@ type Conn struct {
 	fromReceived bool
 	recipients   []string
 	didAuth      bool
+
+	// authFailed indicates that the last AUTH exchange failed and that the
+	// connection is in the command-isolation state defined by RFC 4954
+	// section 4. It is only ever set when Server.EnableAuthFailureIsolation is
+	// enabled. The state is cleared by EHLO/HELO/LHLO, RSET or STARTTLS.
+	authFailed bool
 }
 
 func newConn(c net.Conn, s *Server) *Conn {
@@ -106,6 +112,22 @@ func (c *Conn) handle(cmd string, arg string) {
 	}
 
 	cmd = strings.ToUpper(cmd)
+
+	// RFC 4954 section 4: after a failed authentication exchange, the server
+	// implementation MUST reject all commands other than EHLO, HELO, RSET,
+	// NOOP and QUIT (STARTTLS is also allowed, since it establishes a new
+	// security context) until the client re-negotiates. In particular, mail
+	// commands must not reach the backend.
+	if c.authFailed {
+		switch cmd {
+		case "HELO", "EHLO", "LHLO", "RSET", "NOOP", "VRFY", "QUIT", "STARTTLS":
+			// allowed in the authentication-failure isolation state
+		default:
+			c.writeResponse(503, EnhancedCode{5, 5, 1}, "Authentication failed, issue EHLO before trying again")
+			return
+		}
+	}
+
 	switch cmd {
 	case "SEND", "SOML", "SAML", "EXPN", "HELP", "TURN":
 		// These commands are not implemented in any state
@@ -131,6 +153,10 @@ func (c *Conn) handle(cmd string, arg string) {
 	case "NOOP":
 		c.writeResponse(250, EnhancedCode{2, 0, 0}, "I have successfully done nothing")
 	case "RSET": // Reset session
+		// RFC 4954 section 4 treats a failed AUTH as if RSET had been issued,
+		// so an explicit RSET also ends the authentication-failure isolation
+		// state and permits a new AUTH attempt.
+		c.authFailed = false
 		c.reset()
 		c.writeResponse(250, EnhancedCode{2, 0, 0}, "Session reset")
 	case "BDAT":
@@ -225,6 +251,9 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Domain/address argument required for HELO")
 		return
 	}
+	// A new EHLO/HELO re-negotiation ends the authentication-failure
+	// isolation state (RFC 4954 section 4).
+	c.authFailed = false
 	// c.helo is populated before NewSession so
 	// NewSession can access it via Conn.Hostname.
 	c.helo = domain
@@ -852,6 +881,7 @@ func (c *Conn) handleAuth(arg string) {
 	sasl, err := c.auth(mechanism)
 	if err != nil {
 		c.writeError(454, EnhancedCode{4, 7, 0}, err)
+		c.authExchangeFailed()
 		return
 	}
 
@@ -860,6 +890,7 @@ func (c *Conn) handleAuth(arg string) {
 		challenge, done, err := sasl.Next(response)
 		if err != nil {
 			c.writeError(454, EnhancedCode{4, 7, 0}, err)
+			c.authExchangeFailed()
 			return
 		}
 
@@ -881,18 +912,46 @@ func (c *Conn) handleAuth(arg string) {
 		if encoded == "*" {
 			// https://tools.ietf.org/html/rfc4954#page-4
 			c.writeResponse(501, EnhancedCode{5, 0, 0}, "Negotiation cancelled")
+			c.authExchangeFailed()
 			return
 		}
 
 		response, err = decodeSASLResponse(encoded)
 		if err != nil {
 			c.writeResponse(454, EnhancedCode{4, 7, 0}, "Invalid base64 data")
+			c.authExchangeFailed()
 			return
 		}
 	}
 
 	c.writeResponse(235, EnhancedCode{2, 0, 0}, "Authentication succeeded")
 	c.didAuth = true
+}
+
+// authExchangeFailed applies the transaction cleanup and command-isolation
+// strategy after a failed or aborted AUTH exchange.
+//
+// When Server.EnableAuthFailureIsolation is disabled, it is a no-op and the
+// historical behavior is preserved. Otherwise, per RFC 4954 section 4 the
+// in-progress mail transaction is discarded exactly as if RSET had been
+// issued and the connection enters the authentication-failure isolation
+// state, cleared by a subsequent EHLO/HELO/LHLO, RSET or STARTTLS.
+//
+// A session that already authenticated successfully is never affected: the
+// "Already authenticated" reply is sent before this function can run, so an
+// established authenticated state cannot be silently downgraded by another
+// failing AUTH.
+func (c *Conn) authExchangeFailed() {
+	if !c.server.EnableAuthFailureIsolation {
+		return
+	}
+	// Defensive guard: never downgrade an established authenticated session.
+	if c.didAuth {
+		return
+	}
+
+	c.reset()
+	c.authFailed = true
 }
 
 func decodeSASLResponse(s string) ([]byte, error) {
@@ -950,6 +1009,9 @@ func (c *Conn) handleStartTLS() {
 	}
 	c.helo = ""
 	c.didAuth = false
+	// STARTTLS starts a fresh security context, ending any
+	// authentication-failure isolation state.
+	c.authFailed = false
 	c.reset()
 }
 

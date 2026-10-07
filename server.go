@@ -41,6 +41,23 @@ type Server struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 
+	// EnableAuthFailureIsolation enables command isolation after a failed AUTH
+	// command, as described in RFC 4954 section 4.
+	//
+	// When enabled, after an authentication exchange fails (including an
+	// aborted negotiation), the current mail transaction state is discarded
+	// (as if a RSET command had been issued) and all commands other than
+	// EHLO/HELO/LHLO, RSET, NOOP, VRFY, STARTTLS and QUIT are rejected with a
+	// 503 response until the client re-negotiates with EHLO. In particular,
+	// MAIL and RCPT are rejected before the backend Session is invoked.
+	//
+	// A failed AUTH never clears an already established authenticated state:
+	// sessions that authenticated successfully are not silently downgraded.
+	//
+	// When false (the default), the historical behavior is preserved and a
+	// failed AUTH leaves the session state untouched.
+	EnableAuthFailureIsolation bool
+
 	// Advertise SMTPUTF8 (RFC 6531) capability.
 	// Should be used only if backend supports it.
 	EnableSMTPUTF8 bool

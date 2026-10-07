@@ -55,6 +55,17 @@ type dataReader struct {
 	n       int64 // Maximum bytes remaining
 }
 
+// States of the dataReader state machine, used to elide leading dots and
+// detect the End-of-Data (<CR><LF>.<CR><LF>) line.
+const (
+	stateBeginLine = iota // beginning of line; initial state; must be zero
+	stateDot              // read . at beginning of line
+	stateDotCR            // read .\r at beginning of line
+	stateCR               // read \r (possibly at end of line)
+	stateData             // reading data in middle of line
+	stateEOF              // reached .\r\n end marker line
+)
+
 func newDataReader(c *Conn) *dataReader {
 	dr := &dataReader{
 		r: c.text.R,
@@ -71,6 +82,14 @@ func newDataReader(c *Conn) *dataReader {
 func (r *dataReader) Read(b []byte) (n int, err error) {
 	if r.limited {
 		if r.n <= 0 {
+			// The message exceeded the size limit: do not pass any more
+			// data to the backend. Instead, keep consuming and
+			// discarding input until the terminating <CR><LF>.<CR><LF>
+			// so that the connection stays in sync and the next command
+			// (e.g. RSET) is recognized correctly.
+			if err := r.discardUntilTerminator(); err != nil {
+				return 0, err
+			}
 			return 0, ErrDataTooLarge
 		}
 		if int64(len(b)) > r.n {
@@ -78,19 +97,36 @@ func (r *dataReader) Read(b []byte) (n int, err error) {
 		}
 	}
 
-	// Code below is taken from net/textproto with only one modification to
-	// not rewrite CRLF -> LF.
+	n, err = r.readData(b)
 
-	// Run data through a simple state machine to
-	// elide leading dots and detect End-of-Data (<CR><LF>.<CR><LF>) line.
-	const (
-		stateBeginLine = iota // beginning of line; initial state; must be zero
-		stateDot              // read . at beginning of line
-		stateDotCR            // read .\r at beginning of line
-		stateCR               // read \r (possibly at end of line)
-		stateData             // reading data in middle of line
-		stateEOF              // reached .\r\n end marker line
-	)
+	if r.limited {
+		r.n -= int64(n)
+	}
+	return
+}
+
+// discardUntilTerminator consumes and discards message data until the
+// End-of-Data line (<CR><LF>.<CR><LF>) is reached. Dot-unescaping is still
+// applied while discarding, so the terminator is detected reliably even if
+// it is split across multiple reads.
+func (r *dataReader) discardUntilTerminator() error {
+	var buf [4096]byte
+	for r.state != stateEOF {
+		if _, err := r.readData(buf[:]); err != nil && err != io.EOF {
+			return err
+		}
+	}
+	return nil
+}
+
+// readData reads message data from the underlying reader.
+//
+// Code below is taken from net/textproto with only one modification to
+// not rewrite CRLF -> LF.
+//
+// Data is run through a simple state machine to elide leading dots and
+// detect the End-of-Data (<CR><LF>.<CR><LF>) line.
+func (r *dataReader) readData(b []byte) (n int, err error) {
 	for n < len(b) && r.state != stateEOF {
 		var c byte
 		c, err = r.r.ReadByte()
@@ -139,10 +175,6 @@ func (r *dataReader) Read(b []byte) (n int, err error) {
 	}
 	if err == nil && r.state == stateEOF {
 		err = io.EOF
-	}
-
-	if r.limited {
-		r.n -= int64(n)
 	}
 	return
 }

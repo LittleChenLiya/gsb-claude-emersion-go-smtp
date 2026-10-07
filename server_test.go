@@ -803,6 +803,173 @@ func TestServer_tooLongMessage(t *testing.T) {
 	}
 }
 
+// dataLimitBackend is a minimal backend used to verify the DATA size limit
+// drain policy: it records exactly what is passed to Session.Data.
+type dataLimitBackend struct {
+	datas []dataLimitRecord
+}
+
+type dataLimitRecord struct {
+	data []byte // data passed to Data by the server
+	err  error  // error returned by the data reader
+}
+
+func (be *dataLimitBackend) NewSession(_ *smtp.Conn) (smtp.Session, error) {
+	return &dataLimitSession{be: be}, nil
+}
+
+type dataLimitSession struct {
+	be *dataLimitBackend
+}
+
+func (s *dataLimitSession) Reset()                                       {}
+func (s *dataLimitSession) Logout() error                                { return nil }
+func (s *dataLimitSession) Mail(from string, opts *smtp.MailOptions) error { return nil }
+func (s *dataLimitSession) Rcpt(to string, opts *smtp.RcptOptions) error { return nil }
+
+func (s *dataLimitSession) Data(r io.Reader) error {
+	b, err := ioutil.ReadAll(r)
+	s.be.datas = append(s.be.datas, dataLimitRecord{data: b, err: err})
+	return err
+}
+
+// When DATA exceeds MaxMessageBytes, the server must stop passing data to
+// the backend, drain the remaining input up to the terminating
+// <CR><LF>.<CR><LF> (even if it is split across multiple chunks) and keep
+// the connection usable for the next commands (RSET, new transaction).
+func TestServer_tooLongMessage_drainsToTerminator(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	be := new(dataLimitBackend)
+	s := smtp.NewServer(be)
+	s.Domain = "localhost"
+	s.MaxMessageBytes = 32
+	defer s.Close()
+	go s.Serve(l)
+
+	c, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	scanner := bufio.NewScanner(c)
+
+	expectResp := func(prefix string) {
+		t.Helper()
+		if !scanner.Scan() {
+			t.Fatalf("Expected %v response, got EOF", prefix)
+		}
+		if !strings.HasPrefix(scanner.Text(), prefix) {
+			t.Fatalf("Expected %v response, got: %v", prefix, scanner.Text())
+		}
+	}
+
+	expectResp("220 ")
+	io.WriteString(c, "HELO localhost\r\n")
+	expectResp("250 ")
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	expectResp("250 ")
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	expectResp("250 ")
+	io.WriteString(c, "DATA\r\n")
+	expectResp("354 ")
+
+	// The first line is dot-stuffed (".." -> ".") and fits into the limit,
+	// the second one overflows it.
+	io.WriteString(c, "..dot\r\n")
+	io.WriteString(c, "This line is definitely longer than the 32 bytes limit.\r\n")
+	// The terminating <CR><LF>.<CR><LF> is split across two chunks.
+	io.WriteString(c, ".\r")
+	time.Sleep(100 * time.Millisecond)
+	io.WriteString(c, "\n")
+
+	// Exactly one overrun response is sent, after the terminator.
+	expectResp("552 ")
+
+	if len(be.datas) != 1 {
+		t.Fatal("Invalid number of Data calls:", len(be.datas))
+	}
+	first := be.datas[0]
+	if first.err != smtp.ErrDataTooLarge {
+		t.Fatal("Backend Data error is not ErrDataTooLarge:", first.err)
+	}
+	if int64(len(first.data)) != s.MaxMessageBytes {
+		t.Fatalf("Backend got %v bytes, expected exactly the %v bytes limit",
+			len(first.data), s.MaxMessageBytes)
+	}
+	// Dot-unescaping is preserved for the data within the limit.
+	if !strings.HasPrefix(string(first.data), ".dot\r\n") {
+		t.Fatalf("Dot-stuffed line was not unescaped: %q", first.data)
+	}
+
+	// The connection is still usable: reset and run a new transaction.
+	io.WriteString(c, "RSET\r\n")
+	expectResp("250 ")
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	expectResp("250 ")
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	expectResp("250 ")
+	io.WriteString(c, "DATA\r\n")
+	expectResp("354 ")
+	io.WriteString(c, "Short and sweet.\r\n")
+	io.WriteString(c, ".\r\n")
+	expectResp("250 ")
+
+	if len(be.datas) != 2 {
+		t.Fatal("Invalid number of Data calls:", len(be.datas))
+	}
+	second := be.datas[1]
+	if second.err != nil {
+		t.Fatal("Second message was not accepted after RSET:", second.err)
+	}
+	if string(second.data) != "Short and sweet.\r\n" {
+		t.Fatalf("Unexpected second message data: %q", second.data)
+	}
+
+	// The server itself keeps accepting new connections.
+	c2, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal("Server does not accept new connections:", err)
+	}
+	defer c2.Close()
+	scanner2 := bufio.NewScanner(c2)
+	if !scanner2.Scan() || !strings.HasPrefix(scanner2.Text(), "220 ") {
+		t.Fatal("Invalid greeting on a new connection:", scanner2.Text())
+	}
+}
+
+// Short regression check for the original Session.Data interface: when the
+// DATA size limit is exceeded, the backend observes ErrDataTooLarge from the
+// reader, matching the 552 response sent to the client.
+func TestServer_tooLongMessage_dataErrorRegression(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+
+	s.MaxMessageBytes = 50
+	be.dataErrors = make(chan error, 1)
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+
+	io.WriteString(c, "And much longer than the server's MaxMessageBytes.\r\n")
+	io.WriteString(c, ".\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "552 ") {
+		t.Fatal("Invalid DATA response, expected an error but got:", scanner.Text())
+	}
+
+	if err := <-be.dataErrors; err != smtp.ErrDataTooLarge {
+		t.Fatal("Backend Data error does not match the 552 response:", err)
+	}
+}
+
 // See https://www.postfix.org/smtp-smuggling.html
 func TestServer_smtpSmuggling(t *testing.T) {
 	cases := []struct {

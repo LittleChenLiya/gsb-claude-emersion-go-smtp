@@ -803,6 +803,138 @@ func TestServer_tooLongMessage(t *testing.T) {
 	}
 }
 
+// countingBackend records how many DATA bytes each transaction hands to
+// the backend, used to verify the backend never sees more than
+// MaxMessageBytes even while the server still drains the surplus octets.
+type countingBackend struct {
+	mu       sync.Mutex
+	dataN    []int
+	mailSeen []string
+}
+
+type countingSession struct{ be *countingBackend }
+
+func (be *countingBackend) NewSession(_ *smtp.Conn) (smtp.Session, error) {
+	return &countingSession{be: be}, nil
+}
+
+func (s *countingSession) Mail(from string, _ *smtp.MailOptions) error {
+	s.be.mu.Lock()
+	defer s.be.mu.Unlock()
+	s.be.mailSeen = append(s.be.mailSeen, from)
+	return nil
+}
+func (s *countingSession) Rcpt(_ string, _ *smtp.RcptOptions) error { return nil }
+func (s *countingSession) Reset()                                  {}
+func (s *countingSession) Logout() error                           { return nil }
+
+func (s *countingSession) Data(r io.Reader) error {
+	n, err := io.Copy(io.Discard, r)
+	if err != nil {
+		// io.Copy stops on the first non-nil error; n is the amount of
+		// data actually delivered, which is all we record.
+		_ = err
+	}
+	s.be.mu.Lock()
+	s.be.dataN = append(s.be.dataN, int(n))
+	s.be.mu.Unlock()
+	return nil
+}
+
+// TestServer_dataTooLargeDrain exercises the drain-to-terminator policy
+// for an over-long DATA transaction: the server must stop feeding octets
+// to the backend once MaxMessageBytes is reached, reply 552 after the
+// terminator (split across two writes) has been drained while still
+// applying dot-unstuffing, and keep the connection usable for RSET and a
+// new MAIL transaction.
+func TestServer_dataTooLargeDrain(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	be := new(countingBackend)
+	s := smtp.NewServer(be)
+	s.Domain = "localhost"
+	s.AllowInsecureAuth = true
+	s.MaxMessageBytes = 24
+	defer s.Close()
+	go s.Serve(l)
+
+	c, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	scanner := bufio.NewScanner(c)
+
+	expect := func(prefix, what string) {
+		t.Helper()
+		if !scanner.Scan() {
+			t.Fatalf("no %s reply: %v", what, scanner.Err())
+		}
+		if !strings.HasPrefix(scanner.Text(), prefix) {
+			t.Fatalf("invalid %s response: %q", what, scanner.Text())
+		}
+	}
+
+	expect("220", "greeting")
+	io.WriteString(c, "HELO localhost\r\n")
+	expect("250", "HELO")
+	io.WriteString(c, "MAIL FROM:<big@nsa.gov>\r\n")
+	expect("250", "MAIL")
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	expect("250", "RCPT")
+	io.WriteString(c, "DATA\r\n")
+	expect("354", "DATA")
+
+	// First 24 decoded bytes fit the limit; the rest (including a
+	// dot-stuffed line and a dot-led line) is surplus and must be drained
+	// but never delivered to the backend.
+	io.WriteString(c, "abcdefghijklmnopqrstuvwx") // 24 bytes, no line end yet
+	io.WriteString(c, "yzzzzzzzzzz\r\n")
+	io.WriteString(c, "..stuffed-dot line\r\n") // dot-unstuffing while draining
+	io.WriteString(c, ".not-a-terminator\r\n")  // dot-led line must not abort the drain
+	io.WriteString(c, "tail-line\r")
+
+	// Real end-of-data marker, split across two writes: "\n.\r\n" cut as
+	// "\n.\r" + "\n", with the leading "\n" completing the previous CRLF.
+	io.WriteString(c, "\n.\r")
+	io.WriteString(c, "\n")
+	expect("552 5.3.4", "oversize DATA")
+
+	// The oversize transaction is over; reset and start a new one on the
+	// same connection to prove the command stream was drained correctly.
+	io.WriteString(c, "RSET\r\n")
+	expect("250", "RSET")
+	io.WriteString(c, "MAIL FROM:<small@nsa.gov>\r\n")
+	expect("250", "new MAIL")
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	expect("250", "new RCPT")
+	io.WriteString(c, "DATA\r\n")
+	expect("354", "new DATA")
+	io.WriteString(c, "short\r\n.\r\n")
+	expect("250", "new DATA final")
+
+	io.WriteString(c, "QUIT\r\n")
+	expect("221", "QUIT")
+
+	be.mu.Lock()
+	defer be.mu.Unlock()
+
+	if len(be.dataN) != 2 {
+		t.Fatalf("expected 2 DATA transactions, got %d: %v", len(be.dataN), be.dataN)
+	}
+	if be.dataN[0] != int(s.MaxMessageBytes) {
+		t.Fatalf("backend got %d bytes of the oversize message, want exactly %d", be.dataN[0], s.MaxMessageBytes)
+	}
+	if be.dataN[1] != len("short\r\n") {
+		t.Fatalf("backend got %d bytes of the small message, want %d", be.dataN[1], len("short\r\n"))
+	}
+	if len(be.mailSeen) != 2 || be.mailSeen[1] != "small@nsa.gov" {
+		t.Fatalf("backend did not observe the new MAIL after RSET: %v", be.mailSeen)
+	}
+}
+
 // See https://www.postfix.org/smtp-smuggling.html
 func TestServer_smtpSmuggling(t *testing.T) {
 	cases := []struct {

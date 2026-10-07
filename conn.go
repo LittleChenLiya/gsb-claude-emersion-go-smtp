@@ -984,9 +984,19 @@ func (c *Conn) handleData(arg string) {
 	}
 
 	r := newDataReader(c)
-	code, enhancedCode, msg := dataErrorToStatus(c.Session().Data(r))
-	r.limited = false
-	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+	dataErr := c.Session().Data(r)
+
+	// Size-limit policy: once the message exceeds MaxMessageBytes, no more
+	// octets are handed to the backend; the surplus is drained up to and
+	// including the end-of-data marker (dot-unstuffing still applied), and
+	// the transaction always ends with a 552 reply. This leaves the command
+	// stream positioned right after the terminator, so RSET (and a new
+	// MAIL afterwards) works without closing the connection.
+	_ = r.drain()
+	if r.tooLarge {
+		dataErr = ErrDataTooLarge
+	}
+	code, enhancedCode, msg := dataErrorToStatus(dataErr)
 	c.writeResponse(code, enhancedCode, msg)
 }
 
@@ -1215,8 +1225,12 @@ func (c *Conn) handleDataLMTP() {
 	if !ok {
 		// Fallback to using a single status for all recipients.
 		err := c.Session().Data(r)
-		r.limited = false
-		io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+		// Same drain-to-terminator policy as in handleData: discard the
+		// surplus octets and always report a size-limit failure.
+		_ = r.drain()
+		if r.tooLarge {
+			err = ErrDataTooLarge
+		}
 		for _, rcpt := range c.recipients {
 			status.SetStatus(rcpt, err)
 		}
@@ -1237,9 +1251,16 @@ func (c *Conn) handleDataLMTP() {
 				}
 			}()
 
-			status.fillRemaining(lmtpSession.LMTPData(r, status))
-			r.limited = false
-			io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+			err := lmtpSession.LMTPData(r, status)
+			// Drain up to the end-of-data marker before reporting the
+			// per-recipient statuses, then make sure a size-limit failure
+			// is reported to any recipient the backend did not answer.
+			_ = r.drain()
+			if r.tooLarge {
+				err = ErrDataTooLarge
+				status.fillRemaining(ErrDataTooLarge)
+			}
+			status.fillRemaining(err)
 			done <- true
 		}()
 	}

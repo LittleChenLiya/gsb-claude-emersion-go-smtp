@@ -113,11 +113,66 @@ func TestServer_LMTP_tooLongMessage(t *testing.T) {
 	}
 
 	// See that command stream state is not corrupted e.g. server is not
-	// interpreting the rest of the message body as commands.
+	// interpreting the rest of the message body as commands, and that a
+	// new transaction can be started after the oversize one was drained.
+	io.WriteString(c, "RSET\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RSET response:", scanner.Text())
+	}
+	io.WriteString(c, "MAIL FROM:<root@example.org>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response after oversize DATA:", scanner.Text())
+	}
 	io.WriteString(c, "NOOP\r\n")
 	scanner.Scan()
 	if !strings.HasPrefix(scanner.Text(), "250 ") {
 		t.Fatal("Invalid NOOP response:", scanner.Text())
+	}
+
+	if len(be.messages) != 0 || len(be.anonmsgs) != 0 {
+		t.Fatal("Invalid number of sent messages:", be.messages, be.anonmsgs)
+	}
+}
+
+func TestServer_LMTPData_tooLongMessage(t *testing.T) {
+	be, s, c, scanner := testServerGreetedLMTP(t, func(s *smtp.Server) {
+		s.LMTP = true
+		s.MaxMessageBytes = 50
+		be := s.Backend.(*backend)
+		be.implementLMTPData = true
+	})
+	defer s.Close()
+	defer c.Close()
+
+	sendLHLO(t, scanner, c)
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+
+	io.WriteString(c, "This is a very long message.\r\n")
+	// Terminator split across two writes.
+	io.WriteString(c, "Much longer than the server allows.\r")
+	io.WriteString(c, "\n.\r\n")
+
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "552 ") {
+		t.Fatal("Invalid DATA response, expected 552 but got:", scanner.Text())
+	}
+
+	io.WriteString(c, "RSET\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RSET response:", scanner.Text())
+	}
+	io.WriteString(c, "MAIL FROM:<root@example.org>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response after oversize DATA:", scanner.Text())
 	}
 
 	if len(be.messages) != 0 || len(be.anonmsgs) != 0 {
